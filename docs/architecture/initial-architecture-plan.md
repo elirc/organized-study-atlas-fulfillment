@@ -109,3 +109,66 @@ The first tests focus on domain rules because they are high-risk:
 ## Build Journal
 
 This document was created before implementation to set boundaries. The most important lesson is that architecture starts with ownership: which module owns a concept, which modules may reference it, and which rules must never be duplicated casually.
+
+## Plan versus code (checked against this snapshot)
+
+The plan above was written before implementation. This section records what the code in this repository actually does, item by item. Nothing here was run; it comes from reading the files named.
+
+### Initial scope
+
+| Plan item | Status | Where |
+|---|---|---|
+| Products, SKUs, suppliers, warehouses, inventory counts | modelled, seeded, read-only | `prisma/schema.prisma` (`Product`, `Sku`, `Supplier`, `Warehouse`, `InventoryItem`); `prisma/seed.ts` |
+| Purchase orders and sales orders | modelled, seeded, listed | `purchasing.service.ts`, `orders.service.ts:8-33` |
+| Stock reservations that reduce available-to-promise | **built** | `orders.service.ts:35-135` |
+| Shipments and returns data | shipments listed; returns seeded but never read | `fulfillment.service.ts`; no service touches `Return` |
+| Low-stock alert detection | **built** | `inventory.service.ts:37-60`, rule in `inventoryRules.ts:81-83` |
+| Admin dashboard metrics | **built** | `dashboard.service.ts:8-34` |
+| Background reconciliation worker shape | **built** (one pass, no scheduler) | `src/worker/reconciliation.worker.ts`, `reconciliation.service.ts` |
+| Domain events, outbox, audit adjustment models | events and outbox written on reservation; nothing reads or delivers outbox messages; `InventoryAdjustment` is never written | `orders.service.ts:102-120` |
+| Frontend screens | dashboard, inventory, orders, purchasing, fulfillment, admin | `src/App.tsx` (views at `:169-408`) |
+
+### Module boundaries
+
+The plan names six modules. The code has eight service folders under `src/server/modules/`: `dashboard`, `fulfillment`, `inventory`, `orders`, `platform`, `purchasing`, `worker`, and no `catalog` or `warehouse` folder — SKU and warehouse data are read inside `inventory.service.ts` and `orders.service.ts` directly through Prisma. The boundaries are therefore folder conventions, not enforced interfaces: every service receives the whole `PrismaClient` and can query any table.
+
+### Data consistency rules
+
+| Rule | In code? |
+|---|---|
+| Available = `onHand - reserved` | yes, clamped at 0: `inventoryRules.ts:25-27` |
+| Reservation fails if requested > available | yes, per line: `inventoryRules.ts:45-54`. Two lines for the same SKU are each checked against the full amount, so together they can exceed it. |
+| Reserving increments `reserved`, not `onHand` | yes: `orders.service.ts:81-84` |
+| Shipping decrements both | only as a pure function, `applyShipment` (`inventoryRules.ts:69-79`); no endpoint ships anything |
+| Returns increase `onHand` | not implemented |
+| Every mutation explainable through a record | reservations write `StockReservation`, `DomainEvent`, `OutboxMessage` and `AuditLog` rows; no `InventoryAdjustment` is ever written |
+
+### API shape
+
+All nine planned endpoints exist in `src/server/app.ts`. Two more were added by the feature work: `GET /api/audit-logs` (`:85-91`, feature 002) and `GET /api/exports/inventory.csv` (`:93-101`, feature 003).
+
+### Testing strategy
+
+| Planned test | Exists? |
+|---|---|
+| Reservation succeeds only when sufficient | yes — `tests/inventoryRules.test.ts:24-29` |
+| Failure returns a useful reason | partly — the test checks `available`, not `reason` (`:31-36`) |
+| Shipping updates both quantities | yes — `:42-44` (pure function only) |
+| Low-stock triggers from reorder point and safety stock | reorder point only (`:46-48`); the safety-stock branch is untested |
+| Health and dashboard without a browser | yes — `tests/api.test.ts:8-21`, plus a CSV export test (`:23-28`) |
+
+Not tested at all: `reserveSalesOrder` (the most important transaction), `requireRole`, and the reconciliation worker.
+
+## Exercises
+
+Each has a **Goal** and a **Check** you can observe.
+
+1. **Find the missing boundary.**
+   *Goal:* list every Prisma model each service file queries.
+   *Check:* `inventory.service.ts` reads `InventoryItem`, `Sku`, `Product` and `Warehouse` — three of which the plan assigns to the Catalog and Warehouse modules. Write one sentence on what a "catalog" module interface would have to expose so inventory could stop reading `Sku` directly.
+2. **Close the duplicate-line hole.**
+   *Goal:* make `planReservation` sum quantities per SKU before comparing with availability.
+   *Check:* a new test with two lines `{ skuId: 'sku-pack-green', quantity: 15 }` against the test balance (22 available) returns `ok: false` with `requested: 30`; the existing tests still pass.
+3. **Test the safety-stock branch.**
+   *Goal:* add a test where available is above the reorder point but `onHand` is at or below safety stock.
+   *Check:* for `{ onHand: 30, reserved: 0, reorderPoint: 10, safetyStock: 30 }`, `isLowStock` returns `true`; change `<=` to `<` in the second comparison and the test fails.
